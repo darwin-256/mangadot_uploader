@@ -37,24 +37,31 @@ If you are on Windows, you don't need to install Python.
 ## Option 2: Run from Source (Python / Mac / Linux)
 
 ### Prerequisites
-- **Python 3.12** 
+- **Python 3.12**  
 - You must be **logged in** to [MangaDot.net](https://mangadot.net) on your web browser.
 
 ### Installation
+
 1. Clone the repository:
-   ```bash
-   git clone https://github.com/darwin-256/mangadot_uploader.git
-   cd mangadot_uploader
 
-2.  Install the required dependencies:
+```bash
+git clone https://github.com/darwin-256/mangadot_uploader.git
+cd mangadot_uploader
+```
 
-    py -3.12 -m pip install -r requirements.txt
+2. Install the required dependencies:
 
-3.  Put your files in the chapters/ folder.
+```bash
+py -3.12 -m pip install -r requirements.txt
+```
 
-4.  Run the script:
+3. Put your files in the `chapters` folder.
 
-    py -3.12 mangadot_uploader.py
+4. Run the script:
+
+```bash
+py -3.12 mangadot_uploader.py
+```
 
 ### Log Files
 
