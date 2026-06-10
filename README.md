@@ -1,7 +1,15 @@
+
+
 # MangaDot.net Batch Uploader
 
 A fast, concurrent, and resumable batch uploader for [MangaDot.net](https://mangadot.net). 
 This tool automatically extracts your session cookies directly from your web browser, bypasses basic protections, and securely uploads massive batches of `.cbz` or `.zip` chapters/volumes using the TUS upload protocol.
+
+## Demo / Showcase
+
+https://github.com/user-attachments/assets/61d5825a-0f5c-4293-924e-01d139901409
+
+---
 
 ## Features
 - **No Manual Cookies Needed:** Automatically extracts your active MangaDot session from Chrome, Firefox, Brave, Edge, Opera, or Vivaldi.
@@ -39,9 +47,13 @@ If you are on Windows, you don't need to install Python.
    cd mangadot_uploader
 
 2.  Install the required dependencies:
+
     py -3.12 -m pip install -r requirements.txt
+
 3.  Put your files in the chapters/ folder.
+
 4.  Run the script:
+
     py -3.12 mangadot_uploader.py
 
 ### Log Files
