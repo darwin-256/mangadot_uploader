@@ -8,6 +8,8 @@ import threading
 import concurrent.futures
 import argparse
 import importlib.metadata
+import subprocess
+import platform
 from pathlib import Path
 
 # ==============================================================================
@@ -93,111 +95,256 @@ RETRY_DELAY = 5
 RETRYABLE_STATUSES = [500, 502, 503, 504, 524]
 DEFAULT_CHAPTERS_DIR = "chapters"
 
-# Fallback User-Agents if dynamic detection fails (e.g., on Linux or if registry is locked)
+# Fallback User-Agents — used only if EVERY detection method fails
 DEFAULT_USER_AGENTS = {
-    "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
-    "brave": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-    "edge": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0",
-    "opera": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 OPR/122.0.0.0",
-    "vivaldi": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Vivaldi/7.4.3684.38"
+    "chrome":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "firefox":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
+    "brave":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "edge":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0",
+    "opera":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 OPR/122.0.0.0",
+    "vivaldi":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Vivaldi/7.4.3684.38",
 }
 
-def get_dynamic_user_agent(browser):
-    """
-    Reads the exact installed version of the browser from the OS registry (Windows) 
-    or plist (Mac) to perfectly match the User-Agent with the extracted cookies.
-    No internet connection is used. Fallbacks to hardcoded defaults if missing.
-    """
-    import sys
-    import re
-    
-    # Helper to strip out any garbage (like "(x64 en-US)") and keep ONLY the version numbers
-    def clean_version(raw):
-        if not raw: return None
-        match = re.search(r'(\d+(?:\.\d+)*)', str(raw))
-        return match.group(1) if match else None
+# Official, free, no-auth version APIs (web fallback)
+_WEB_VERSION_APIS = {
+    "chrome":  "https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/stable/versions?pageSize=1",
+    "firefox": "https://product-details.mozilla.org/1.0/firefox_versions.json",
+}
 
-    if sys.platform == 'win32':
-        try:
-            import winreg
-            def get_reg_val(hive, path, key):
-                try:
-                    reg_key = winreg.OpenKey(hive, path)
-                    val, _ = winreg.QueryValueEx(reg_key, key)
-                    winreg.CloseKey(reg_key)
-                    return val
-                except Exception:
-                    return None
+# Cache so we only detect once per browser per process lifetime
+_UA_CACHE = {}
 
-            raw_version = None
-            if browser == "chrome":
-                raw_version = get_reg_val(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Google\Chrome\BLBeacon", "version")
-            elif browser == "edge":
-                raw_version = get_reg_val(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{56EB18F8-B008-4CBD-B6D2-8C97FE7E7558}", "pv")
-            elif browser == "brave":
-                raw_version = get_reg_val(winreg.HKEY_CURRENT_USER, r"SOFTWARE\BraveSoftware\Brave-Browser\BLBeacon", "version")
-            elif browser == "firefox":
-                raw_version = get_reg_val(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Mozilla\Mozilla Firefox", "CurrentVersion")
-            elif browser == "opera":
-                raw_version = get_reg_val(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Opera Software\BLBeacon", "version")
-            elif browser == "vivaldi":
-                raw_version = get_reg_val(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Vivaldi\BLBeacon", "version")
-                
-            version = clean_version(raw_version)
-            
-            if version:
-                major = version.split('.')[0]
-                if browser == "firefox":
-                    return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{version}) Gecko/20100101 Firefox/{version}"
-                elif browser == "edge":
-                    return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
-                elif browser == "opera":
-                    return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0"
-                elif browser == "vivaldi":
-                    return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0"
-                elif browser in ("chrome", "brave"):
-                    return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
-                    
-        except Exception:
-            pass # Fall through to hardcoded defaults if registry access fails
-            
-    elif sys.platform == 'darwin':
-        import plistlib
-        app_paths = {
-            "chrome": "/Applications/Google Chrome.app/Contents/Info.plist",
-            "edge": "/Applications/Microsoft Edge.app/Contents/Info.plist",
-            "brave": "/Applications/Brave Browser.app/Contents/Info.plist",
-            "firefox": "/Applications/Firefox.app/Contents/Info.plist",
-            "opera": "/Applications/Opera.app/Contents/Info.plist",
-            "vivaldi": "/Applications/Vivaldi.app/Contents/Info.plist"
+
+def _clean_version(raw):
+    """Extract the first dotted version number from any string."""
+    if not raw:
+        return None
+    m = re.search(r'(\d+(?:\.\d+)*)', str(raw))
+    return m.group(1) if m else None
+
+
+def _detect_windows_arch():
+    """Return the architecture token used in Windows User-Agents."""
+    machine = platform.machine().lower()
+    if machine in ('amd64', 'x86_64'):
+        return 'Win64; x64'
+    # On 32-bit Windows we omit the arch token (rare in 2024+)
+    return ''
+
+
+def _detect_macos_ver():
+    """Return an underscore-joined macOS version, e.g. '14_4_1' or '10_15_7'."""
+    try:
+        ver = platform.mac_ver()[0]  # '14.4.1' or '' on non-Mac
+        if ver and ver != '':
+            parts = ver.split('.')
+            if len(parts) >= 2:
+                base = f"{parts[0]}_{parts[1]}"
+                if len(parts) >= 3 and parts[2]:
+                    base += f"_{parts[2]}"
+                return base
+    except Exception:
+        pass
+    return "10_15_7"
+
+
+def _read_windows_registry(browser):
+    """Return installed browser version from the Windows registry, or None."""
+    try:
+        import winreg
+        paths = {
+            "chrome":  [(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Google\Chrome\BLBeacon", "version"),
+                        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Google\Chrome\BLBeacon", "version")],
+            "edge":    [(winreg.HKEY_CURRENT_USER,
+                          r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{56EB18F8-B008-4CBD-B6D2-8C97FE7E7558}", "pv"),
+                        (winreg.HKEY_LOCAL_MACHINE,
+                          r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{56EB18F8-B008-4CBD-B6D2-8C97FE7E7558}", "pv")],
+            "brave":   [(winreg.HKEY_CURRENT_USER, r"SOFTWARE\BraveSoftware\Brave-Browser\BLBeacon", "version")],
+            "opera":   [(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Opera Software\BLBeacon", "version")],
+            "vivaldi": [(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Vivaldi\BLBeacon", "version")],
+            "firefox": [(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Mozilla\Mozilla Firefox", "CurrentVersion"),
+                        (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Mozilla\Mozilla Firefox", "CurrentVersion"),
+                        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Mozilla\Mozilla Firefox", "CurrentVersion")],
         }
-        path = app_paths.get(browser)
-        if path and os.path.exists(path):
+        for hive, path, key in paths.get(browser, []):
             try:
-                with open(path, 'rb') as f:
-                    plist = plistlib.load(f)
-                    raw_version = plist.get('CFBundleShortVersionString')
-                    version = clean_version(raw_version)
-                    
-                    if version:
-                        major = version.split('.')[0]
-                        if browser == "firefox":
-                            return f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:{version}) Gecko/20100101 Firefox/{version}"
-                        elif browser == "edge":
-                            return f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
-                        elif browser == "opera":
-                            return f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0"
-                        elif browser == "vivaldi":
-                            return f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0"
-                        else:
-                            return f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
-            except Exception:
-                pass
+                with winreg.OpenKey(hive, path) as k:
+                    val, _ = winreg.QueryValueEx(k, key)
+                    v = _clean_version(val)
+                    if v:
+                        return v
+            except OSError:
+                continue
+    except Exception:
+        return None
+    return None
 
-    # Fallback to hardcoded defaults if dynamic check fails or OS is Linux
-    return DEFAULT_USER_AGENTS.get(browser, DEFAULT_USER_AGENTS["chrome"])
 
+def _read_mac_plist(browser):
+    """Return installed browser version from a macOS .app Info.plist, or None."""
+    try:
+        import plistlib
+        paths = {
+            "chrome":  "/Applications/Google Chrome.app/Contents/Info.plist",
+            "edge":    "/Applications/Microsoft Edge.app/Contents/Info.plist",
+            "brave":   "/Applications/Brave Browser.app/Contents/Info.plist",
+            "firefox": "/Applications/Firefox.app/Contents/Info.plist",
+            "opera":   "/Applications/Opera.app/Contents/Info.plist",
+            "vivaldi": "/Applications/Vivaldi.app/Contents/Info.plist",
+        }
+        path = paths.get(browser)
+        if not path or not os.path.exists(path):
+            return None
+        with open(path, 'rb') as f:
+            plist = plistlib.load(f)
+            # Chromium apps put the full version in KSVersion; Firefox uses CFBundleShortVersionString
+            raw = plist.get('KSVersion') or plist.get('CFBundleShortVersionString')
+            return _clean_version(raw)
+    except Exception:
+        return None
+
+
+def _read_linux_version(browser):
+    """Return installed browser version by running `<binary> --version` on Linux."""
+    cmds = {
+        "chrome":  ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"],
+        "edge":    ["microsoft-edge", "microsoft-edge-stable"],
+        "brave":   ["brave-browser", "brave"],
+        "firefox": ["firefox", "firefox-esr"],
+        "opera":   ["opera"],
+        "vivaldi": ["vivaldi", "vivaldi-stable"],
+    }
+    for cmd in cmds.get(browser, []):
+        try:
+            out = subprocess.run(
+                [cmd, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout:
+                return _clean_version(out.stdout)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def _fetch_web_version(browser, timeout=5):
+    """Fetch the latest stable version from the official vendor API."""
+    try:
+        if browser == "firefox":
+            r = requests.get(_WEB_VERSION_APIS["firefox"], timeout=timeout)
+            if r.status_code == 200:
+                return _clean_version(r.json().get("LATEST_FIREFOX_VERSION"))
+        elif browser in ("chrome", "edge"):
+            # Edge doesn't have a public version API, but it's Chromium-based.
+            # Its major version always matches Chrome's stable major version.
+            r = requests.get(_WEB_VERSION_APIS["chrome"], timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                versions = data.get("versions") or []
+                if versions:
+                    return _clean_version(versions[0].get("version"))
+    except Exception:
+        return None
+    return None
+
+def _build_user_agent(browser, version):
+    """Build a platform-aware User-Agent string from browser + version."""
+    if not version:
+        return DEFAULT_USER_AGENTS.get(browser, DEFAULT_USER_AGENTS["chrome"])
+
+    major = version.split('.')[0]
+
+    # --- Windows ---
+    if sys.platform == 'win32':
+        arch = _detect_windows_arch()
+        nt = "Windows NT 10.0"
+        arch_clause = f"{nt}; {arch}" if arch else nt
+        if browser == "firefox":
+            # Firefox UA Reduction: rv: and Firefox/ must be major.0
+            return f"Mozilla/5.0 ({arch_clause}; rv:{major}.0) Gecko/20100101 Firefox/{major}.0"
+        if browser == "edge":
+            return (f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    f"Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0")
+        if browser == "opera":
+            return (f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    f"Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0")
+        if browser == "vivaldi":
+            return (f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    f"Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0")
+        # chrome, brave
+        return (f"Mozilla/5.0 ({arch_clause}) AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{major}.0.0.0 Safari/537.36")
+
+    # --- macOS ---
+    if sys.platform == 'darwin':
+        mac_ver = _detect_macos_ver()
+        if browser == "firefox":
+            return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}; rv:{major}.0) "
+                    f"Gecko/20100101 Firefox/{major}.0")
+        if browser == "edge":
+            return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0")
+        if browser == "opera":
+            return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0")
+        if browser == "vivaldi":
+            return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0")
+        return (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {mac_ver}) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+
+    # --- Linux / other ---
+    if browser == "firefox":
+        return (f"Mozilla/5.0 (X11; Linux x86_64; rv:{major}.0) "
+                f"Gecko/20100101 Firefox/{major}.0")
+    if browser == "edge":
+        return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0")
+    if browser == "opera":
+        return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{major}.0.0.0 Safari/537.36 OPR/{major}.0.0.0")
+    if browser == "vivaldi":
+        return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{major}.0.0.0 Safari/537.36 Vivaldi/{major}.0.0.0")
+    return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36")
+
+
+def get_dynamic_user_agent(browser):
+    """Return a User-Agent that matches the locally installed browser version.
+
+    Detection cascade (first hit wins):
+      1. Local OS source  – Windows registry / macOS plist / Linux `--version`
+      2. Official web API – Google VersionHistory / Mozilla product-details
+      3. Hardcoded fallback in DEFAULT_USER_AGENTS
+
+    Results are cached for the lifetime of the process.
+    """
+    if browser in _UA_CACHE:
+        return _UA_CACHE[browser]
+
+    version = None
+
+    # 1. Local detection
+    try:
+        if sys.platform == 'win32':
+            version = _read_windows_registry(browser)
+        elif sys.platform == 'darwin':
+            version = _read_mac_plist(browser)
+        else:
+            version = _read_linux_version(browser)
+    except Exception:
+        version = None
+
+    # 2. Web fallback for browsers that expose a stable, public version API
+    if not version and browser in ("chrome", "edge", "firefox"):
+        version = _fetch_web_version(browser)
+
+    # 3. Build (or fall back to defaults)
+    ua = _build_user_agent(browser, version)
+
+    _UA_CACHE[browser] = ua
+    return ua
 class Colors:
     HEADER = '\033[95m'
     OKCYAN = '\033[96m'
@@ -708,8 +855,8 @@ def main():
         elif choice in supported_browsers:
             current_browser = supported_browsers[choice][0]
         else:
-            print_error("Invalid selection. Defaulting back to Chrome.")
-            current_browser = "chrome"
+            print_error("Invalid selection. Defaulting back to Firefox.")
+            current_browser = "firefox"
 
     print("\n" + "-"*40 + "\n")
 
