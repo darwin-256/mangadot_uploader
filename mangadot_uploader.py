@@ -250,7 +250,7 @@ def _fetch_web_version(browser, timeout=5):
 def _build_user_agent(browser, version):
     """Build a platform-aware User-Agent string from browser + version."""
     if not version:
-        return DEFAULT_USER_AGENTS.get(browser, DEFAULT_USER_AGENTS["chrome"])
+        return DEFAULT_USER_AGENTS.get(browser, DEFAULT_USER_AGENTS["firefox"])
 
     major = version.split('.')[0]
 
@@ -446,7 +446,7 @@ def encode_tus_metadata(meta_dict):
         pairs.append(f"{k} {encoded_val}")
     return ",".join(pairs)
 
-def parse_filename_details(filename, upload_type="chapter", chapter_naming="extract"):
+def parse_filename_details(filename, upload_type="chapter", chapter_naming="extract", custom_regex=None):
     name_without_ext = re.sub(r'\.(cbz|zip)$', '', filename, flags=re.IGNORECASE)
     
     # 1. Search the ENTIRE string for the volume/chapter number first
@@ -466,16 +466,28 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
         return None, None
 
     # 2. For volumes, format the number to always have exactly 2 decimal places
-    # e.g. 5 becomes "Vol. 5.00", 5.5 becomes "Vol. 5.50"
     if upload_type == "volume" and num is not None:
         title = f"Vol. {num:.2f}"
         return num, title
 
-    # 3. Chapter Naming Preset — override messy filenames with clean "Chapter X"
+    # 3. Custom Regex — extract title using user-provided pattern
+    if chapter_naming == "custom" and custom_regex:
+        try:
+            c_match = re.search(custom_regex, name_without_ext)
+            if c_match:
+                # If the regex has a capture group, use group(1). Otherwise, use the whole match (group 0).
+                title = c_match.group(1).strip() if c_match.groups() else c_match.group(0).strip()
+                return num, title
+            else:
+                print_warning(f"Custom regex did not match '{filename}'. Falling back to Auto-detect.")
+        except re.error as e:
+            print_warning(f"Invalid regex '{custom_regex}' ({e}). Falling back to Auto-detect.")
+
+    # 4. Chapter Naming Preset — override messy filenames with clean "Chapter X"
     if chapter_naming == "preset" and num is not None:
         return num, f"Chapter {num:g}"
 
-    # 4. For chapters (Auto-detect), extract a meaningful title by removing the matched number portion
+    # 5. For chapters (Auto-detect), extract a meaningful title by removing the matched number portion
     title = None
     parts = name_without_ext.split(' - ', 1)
     
@@ -485,19 +497,14 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
         part0_has_num = match.start() < split_idx if match else False
             
         if part0_has_num:
-            # Number is in the first part (e.g. "c07 - Title")
             title = parts[1].strip()
         else:
-            # Number is in the second part (e.g. "Title - c07")
             title = parts[0].strip()
-            # If there's text after the chapter number in the second part, append it
-            # E.g. "Title - c07 - Extra" becomes "Title - Extra"
             if match:
                 remaining = parts[1].replace(match.group(0), '').strip(' -_')
                 if remaining:
                     title = f"{title} - {remaining}"
     else:
-        # No dash, just remove the matched chapter identifier to isolate the title
         if match:
             title = name_without_ext.replace(match.group(0), '').strip(' -_')
             if not title: 
@@ -507,7 +514,7 @@ def parse_filename_details(filename, upload_type="chapter", chapter_naming="extr
 
     return num, title
 
-def get_files_in_dir(directory, upload_type, chapter_naming="extract"):
+def get_files_in_dir(directory, upload_type, chapter_naming="extract", custom_regex=None):
     valid_extensions = ('.cbz', '.zip')
     files_data = []
     
@@ -516,7 +523,7 @@ def get_files_in_dir(directory, upload_type, chapter_naming="extract"):
         filepath = os.path.join(directory, filename)
         if not os.path.isfile(filepath): continue
             
-        num, title = parse_filename_details(filename, upload_type, chapter_naming)
+        num, title = parse_filename_details(filename, upload_type, chapter_naming, custom_regex)
         if num is None:
             print_warning(f"Could not detect {upload_type} number from '{filename}'. Skipping.")
             continue
@@ -717,14 +724,22 @@ def run_dry_run():
 
     # --- Chapter Naming Preset ---
     chapter_naming = "extract"
+    custom_regex = None
     if upload_type == "chapter":
-        naming_choice = prompt("Chapter naming format? (1) Auto-detect title  (2) Force 'Chapter X'", default="2")
-        chapter_naming = "preset" if naming_choice == "2" else "extract"
+        naming_choice = prompt("Chapter naming format? (1) Auto-detect title  (2) Force 'Chapter X'  (3) Custom regex", default="2")
+        if naming_choice == "2":
+            chapter_naming = "preset"
+        elif naming_choice == "3":
+            chapter_naming = "custom"
+            print_info("Regex Tip: If your regex has parentheses (Group 1), that group becomes the title. Otherwise, the whole match is used.")
+            custom_regex = prompt("Enter your regex pattern")
+        else:
+            chapter_naming = "extract"
 
     # --- Scan Files ---
     print("\n" + "-"*40 + "\n")
     print_info("Scanning directory for files...")
-    files = get_files_in_dir(directory, upload_type, chapter_naming)
+    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex)
     if not files:
         print_error("No valid .cbz or .zip files found in the directory.")
         sys.exit(1)
@@ -848,7 +863,7 @@ def main():
             print(f"  [{key}] {name.title()}{active_marker}")
         print("  [q] Quit script")
         
-        choice = prompt("Select an option", default="1").lower()
+        choice = prompt("Select an option", default="2").lower()
         if choice == 'q':
             print_info("Exiting script.")
             sys.exit(0)
@@ -900,9 +915,17 @@ def main():
 
     # --- Chapter Naming Preset ---
     chapter_naming = "extract"
+    custom_regex = None
     if upload_type == "chapter":
-        naming_choice = prompt("Chapter naming format? (1) Auto-detect title  (2) Force 'Chapter X'", default="2")
-        chapter_naming = "preset" if naming_choice == "2" else "extract"
+        naming_choice = prompt("Chapter naming format? (1) Auto-detect title  (2) Force 'Chapter X'  (3) Custom regex", default="2")
+        if naming_choice == "2":
+            chapter_naming = "preset"
+        elif naming_choice == "3":
+            chapter_naming = "custom"
+            print_info("Regex Tip: If your regex has parentheses (Group 1), that group becomes the title. Otherwise, the whole match is used.")
+            custom_regex = prompt("Enter your regex pattern")
+        else:
+            chapter_naming = "extract"
 
     language = prompt("Language code", default="en")
 
@@ -945,10 +968,10 @@ def main():
             else: print_error("Please enter a number between 1 and 10.")
         except ValueError: print_error("Invalid input.")
 
-        # --- Scan Files ---
+    # --- Scan Files ---
     print("\n" + "-"*40 + "\n")
     print_info("Scanning directory for files...")
-    files = get_files_in_dir(directory, upload_type, chapter_naming)
+    files = get_files_in_dir(directory, upload_type, chapter_naming, custom_regex)
     if not files:
         print_error("No valid .cbz or .zip files found in the directory.")
         sys.exit(1)
