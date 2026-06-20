@@ -381,11 +381,20 @@ class UIRenderer:
             info = self.status[key]
             status_text, progress = info["status"], info["progress"]
             
+            # Calculate visual length: add 1 extra space if an emoji is present
+            visual_len = len(status_text)
+            if "✅" in status_text or "❌" in status_text:
+                visual_len += 1
+                
+            padding = 25 - visual_len
+            if padding < 0: padding = 0
+            padded_status = f"{status_text}{' ' * padding}"
+            
             bar_color = Colors.OKGREEN if progress == 1.0 and ("✅" in status_text) else (Colors.FAIL if "❌" in status_text else Colors.WARNING)
             bar = f"[{bar_color}{'#' * int(progress * 20):<20}{Colors.RESET}]"
             status_color = Colors.OKGREEN if "✅" in status_text else (Colors.FAIL if "❌" in status_text else "")
             
-            line = f"  {key:<30.30}: {status_color}{status_text:<25.25}{Colors.RESET} {bar} {progress*100:3.0f}%"
+            line = f"  {key:<30.30}: {status_color}{padded_status}{Colors.RESET} {bar} {progress*100:3.0f}%"
             sys.stdout.write(f"{line}\033[K\n")
             
         self.height = 1 + len(chapters_to_display)
@@ -769,6 +778,72 @@ def run_dry_run():
     input(f"\n{Colors.WARNING}Press Enter to exit...{Colors.RESET}")
     sys.exit(0)
 
+def process_uploads(files_to_upload, req_session, manga_id, group_ids, upload_type, language, scanlator_name, thread_count):
+    chunks = [files_to_upload[i:i + MAX_BATCH_SIZE] for i in range(0, len(files_to_upload), MAX_BATCH_SIZE)]
+    
+    file_keys = [f["filename"] for f in files_to_upload]
+    renderer = UIRenderer(file_keys)
+    renderer.start()
+    
+    failed_chapters = []
+
+    # --- Batch Process Loop ---
+    for chunk_idx, chunk in enumerate(chunks, 1):
+        # 1. Initialize Batch
+        chapters_payload = []
+        for f in chunk:
+            chapters_payload.append({
+                "chapter_number": f["number"] if upload_type == "chapter" else 0,
+                "volume_number": f["number"] if upload_type == "volume" else None,
+                "chapter_title": f["title"]
+            })
+            
+        init_payload = {
+            "manga_id": manga_id,
+            "language": language,
+            "group_ids": group_ids,
+            "type": upload_type,
+            "scanlator_name": scanlator_name,
+            "chapters": chapters_payload
+        }
+        
+        try:
+            res = req_session.post(BATCH_INIT_ENDPOINT, json=init_payload, timeout=600)
+            res.raise_for_status()
+            batch_data = res.json()
+            if not batch_data.get("success"): raise Exception(str(batch_data))
+            batch_id = batch_data["batch_id"]
+        except Exception as e:
+            for f in chunk: 
+                renderer.update_chapter_status(f["filename"], f"❌ Batch Init Failed", 1.0)
+                failed_chapters.append(f["filename"])
+            continue
+
+        # 2. Upload chunk via TUS with ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+            futures = [executor.submit(
+                upload_file_tus_worker, req_session, renderer, f, manga_id, group_ids, upload_type, batch_id, language, scanlator_name
+            ) for f in chunk]
+            
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if not result['success']:
+                    renderer.update_chapter_status(result['key'], f"❌ {result['error']}", 1.0)
+                    failed_chapters.append(result['key'])
+
+        # 3. Complete Batch
+        try:
+            comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=600)
+            comp_res.raise_for_status()
+        except Exception as e:
+            pass
+            
+    # Cleanup UI
+    sys.stdout.write("\n" * 2)
+    sys.stdout.flush()
+    
+    return failed_chapters    
+
 def main():
     parser = argparse.ArgumentParser(description="MangaDot.net Batch Uploader")
     parser.add_argument(
@@ -1002,72 +1077,25 @@ def main():
         print_info("Upload aborted by user.")
         sys.exit(0)
 
-    chunks = [files[i:i + MAX_BATCH_SIZE] for i in range(0, len(files), MAX_BATCH_SIZE)]
-    total_chunks = len(chunks)
+    current_files_to_upload = files
     
-    file_keys = [f["filename"] for f in files]
-    renderer = UIRenderer(file_keys)
-    renderer.start()
-    
-    failed_chapters = []
-
-    # --- Batch Process Loop ---
-    for chunk_idx, chunk in enumerate(chunks, 1):
-        # 1. Initialize Batch
-        chapters_payload = []
-        for f in chunk:
-            chapters_payload.append({
-                "chapter_number": f["number"] if upload_type == "chapter" else 0,
-                "volume_number": f["number"] if upload_type == "volume" else None,
-                "chapter_title": f["title"]
-            })
-            
-        init_payload = {
-            "manga_id": manga_id,
-            "language": language,
-            "group_ids": group_ids,
-            "type": upload_type,
-            "scanlator_name": scanlator_name,
-            "chapters": chapters_payload
-        }
+    # --- Upload & Retry Loop ---
+    while True:
+        # Run the upload process
+        failed_chapters = process_uploads(
+            current_files_to_upload, req_session, manga_id, group_ids, upload_type, language, scanlator_name, thread_count
+        )
         
-        try:
-            res = req_session.post(BATCH_INIT_ENDPOINT, json=init_payload, timeout=600)
-            res.raise_for_status()
-            batch_data = res.json()
-            if not batch_data.get("success"): raise Exception(str(batch_data))
-            batch_id = batch_data["batch_id"]
-        except Exception as e:
-            for f in chunk: 
-                renderer.update_chapter_status(f["filename"], f"❌ Batch Init Failed", 1.0)
-                failed_chapters.append(f["filename"])
-            continue
+        print(f"{Colors.OKCYAN}--- 🎉 All operations complete. ---{Colors.RESET}")
 
-        # 2. Upload chunk via TUS with ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
-            futures = [executor.submit(
-                upload_file_tus_worker, req_session, renderer, f, manga_id, group_ids, upload_type, batch_id, language, scanlator_name
-            ) for f in chunk]
-            
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if not result['success']:
-                    renderer.update_chapter_status(result['key'], f"❌ {result['error']}", 1.0)
-                    failed_chapters.append(result['key'])
+        if not failed_chapters:
+            print(f"{Colors.OKGREEN}✅ All chapters were processed successfully!")
+            # If there were no failures, delete any old failed.txt so it doesn't cause confusion
+            if os.path.exists("failed.txt"):
+                os.remove("failed.txt")
+            break
 
-        # 3. Complete Batch
-        try:
-            comp_res = req_session.post(f"{BASE_URL}/api/uploads/batch/{batch_id}/complete", timeout=600)
-            comp_res.raise_for_status()
-        except Exception as e:
-            # Just log it silently via the renderer logic
-            pass
-            
-    # Cleanup UI
-    sys.stdout.write("\n" * (renderer.height + 1))
-    print(f"{Colors.OKCYAN}--- 🎉 All operations complete. ---{Colors.RESET}")
-
-    if failed_chapters:
+        # 1. Populate failed.txt
         print(f"{Colors.FAIL}⚠️ {len(failed_chapters)} chapters failed to upload after all retries.{Colors.RESET}")
         try:
             with open("failed.txt", "w", encoding="utf-8") as f:
@@ -1076,8 +1104,16 @@ def main():
             print(f"A list of failed chapters has been saved to {Colors.OKCYAN}`failed.txt`{Colors.RESET}.")
         except Exception as e:
             print(f"{Colors.FAIL}Could not write to `failed.txt`: {e}")
-    else:
-        print(f"{Colors.OKGREEN}✅ All chapters were processed successfully!")
+            break
+
+        # 2. Prompt to retry before exiting
+        retry_choice = prompt("Would you like to rerun the upload script for ONLY these failed entries? (y/n)", default="y").lower()
+        if not retry_choice.startswith('y'):
+            break
+            
+        # 3. Filter the list to only include files that failed and loop again
+        current_files_to_upload = [f for f in current_files_to_upload if f["filename"] in failed_chapters]
+        print_info(f"\nRetrying {len(current_files_to_upload)} failed chapter(s)...")
 
     input(f"\n{Colors.WARNING}Press Enter to exit...{Colors.RESET}")
 
