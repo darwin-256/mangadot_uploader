@@ -619,7 +619,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, up
     for attempt in range(MAX_RETRIES):
         try:
             renderer.update_chapter_status(filename, "Creating upload...", 0.0)
-            res = session.post(TUS_ENDPOINT, headers=headers, timeout=600)
+            res = session.post(TUS_ENDPOINT, headers=headers, timeout=30)
             res.raise_for_status()
             upload_location = res.headers.get("Location")
             if not upload_location: raise ValueError("No Location header")
@@ -648,7 +648,7 @@ def upload_file_tus_worker(session, renderer, file_info, manga_id, group_ids, up
                     }
                     try:
                         renderer.update_chapter_status(filename, "Uploading...", offset/size)
-                        patch_res = session.patch(upload_location, headers=patch_headers, data=chunk, timeout=600)
+                        patch_res = session.patch(upload_location, headers=patch_headers, data=chunk, timeout=60)
                         
                         if patch_res.status_code == 204:
                             offset += len(chunk)
